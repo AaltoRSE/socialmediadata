@@ -1,5 +1,4 @@
 import argparse
-from collections import namedtuple
 from datetime import datetime
 import multiprocessing
 import orjson as json
@@ -9,31 +8,105 @@ import sys
 
 import zst
 
+
+columns_submissions = [
+    ('subreddit', 'TEXT'),
+    ('id', 'TEXT'),
+    ('created_utc', 'INTEGER'),
+    ('author', 'TEXT'),
+    ('hidden', 'INTEGER'),
+    ('is_self', 'INTEGER'),
+    ('domain', 'TEXT'),
+    ('num_comments', 'INTEGER'),
+    ('over_18', 'INTEGER'),
+    ('score', 'INTEGER'),
+    ('subreddit_id', 'TEXT'),
+    ('title', 'TEXT'),
+    ('url', 'TEXT'),
+    ('selftext', 'TEXT'),
+    ]
+
+columns_comments = [
+    ('subreddit', 'TEXT'),
+    ('author', 'TEXT'),
+    ('id', 'TEXT'),
+    ('link_id', 'TEXT'),
+    ('parent_id', 'TEXT'),
+    ('controversiality', 'INTEGER'),
+    ('created_utc', 'INTEGER'),
+    ('distinguished', 'INTEGER'),
+    ('ups', ''),
+    ('downs', 'INTEGER'),
+    ('gilded', 'INTEGER'),
+    ('score', 'INTEGER'),
+    ('score_hidden', 'INTEGER'),
+    ('subreddit_id', 'TEXT'),
+    ('name', 'TEXT'),
+    ('body', 'TEXT'),
+    ]
+
+
 # Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('db')
 parser.add_argument('files', nargs='+')
+parser.add_argument('--readers', type=int, default=1, help="num reader processes")
+parser.add_argument('--decoders', type=int, default=1, help="num decoder processes")
+parser.add_argument('--comments', action='store_true', help="process comments files")
+parser.add_argument('--index', action='store_true', help="Do nothing but create indexes")
 args = parser.parse_args()
 
+
+TABLE = 'submissions'
+COLUMNS = columns_submissions
+if args.comments:
+    TABLE = 'comments'
+    COLUMNS = columns_comments
+
+
+if args.index:
+    indexes = [
+        ('submissions', 'subreddit, created_utc'),
+        ('submissions', 'subreddit, author'),
+        ('submissions', 'id'),
+        ('submissions', 'author'),
+        ('comments', 'subreddit, created_utc'),
+        ('comments', 'subreddit, auther'),
+        ('comments', 'auther'),
+        ('comments', 'id'),
+        ('comments', 'link_id'),
+        ('comments', 'parent_id'),
+        ]
+
+    for i, (table, cols) in enumerate(indexes):
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{i} ON {table} ({cols})")
+        conn.commit()
+
+    exit(0)
 
 # Open and set up database
 conn = sqlite3.connect(args.db)
 conn.execute('PRAGMA page_size = 32768;')
+#conn.execute('PRAGMA mmap_siz = 10737418240;')
 conn.execute('PRAGMA journal_mode = off;') # or WAL
+conn.commit()
 
 
 # Make columns, etc.
-conn.execute('CREATE TABLE IF NOT EXISTS submissions (sub TEXT, time INTEGER, author TEXT, body BLOB)')
+#conn.execute('CREATE TABLE IF NOT EXISTS submissions (sub TEXT, time INTEGER, author TEXT, body BLOB)')
+conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} ('
+             f'{", ".join(" ".join(x) for x in COLUMNS)}'
+             f')')
+conn.commit()
 
 
-Message1 = namedtuple('Message1', ('sub', 'line'))
-Message2 = namedtuple('Message2', ('sub', 'created_utc', 'author', 'line'))
 
-
-
-def read(queue, file_, sub=None, file_size=None):
+def read(file_):
     """Read and decompress lines from file, put in queue
     """
+    queue = queue1
+    file_size = os.stat(file_).st_size
+    sub = os.path.basename(file_).rsplit('_', 1)[0]
     global file_lines
     global bad_lines
     global bytes_processed
@@ -42,7 +115,7 @@ def read(queue, file_, sub=None, file_size=None):
     print(f"read: starting {file_}")
     for i, (line, file_bytes_processed) in enumerate(zst.read_lines_zst(file_)):
         file_lines += 1
-        accumulated.append((sub, line))
+        accumulated.append(line)
         # Every 100000 lines, print status and push into queue.
         if file_lines % 100000 == 0:
             #created = datetime.utcfromtimestamp(int(obj['created_utc']))
@@ -51,7 +124,7 @@ def read(queue, file_, sub=None, file_size=None):
                   f"{file_lines:,} : {bad_lines:,} : {file_bytes_processed:,}: "
                   f"{(file_bytes_processed / file_size) * 100:.0f}% "
                   f"({((file_bytes_processed + bytes_processed) / bytes_total) * 100:.0f}%) "
-                  f"({queue.qsize()})"
+                  f"({queue1.qsize()}, {queue2.qsize()})"
                   )
             queue.put(accumulated)
             accumulated = [ ]
@@ -59,7 +132,7 @@ def read(queue, file_, sub=None, file_size=None):
     queue.put(accumulated)
     bytes_processed += file_bytes_processed
     print("read: done with {file_}")
-
+    #queue.close()
 
 
 def decode(queue_in, queue_out):
@@ -78,21 +151,22 @@ def decode(queue_in, queue_out):
 
         # For each line, load JSON and accumulate whatever our final
         # values will be.
-        for sub, line in x:
+        for line in x:
             try:
                 obj = json.loads(line)
             except (KeyError, json.JSONDecodeError) as err:
                 bad_lines += 1
-            accumulated.append((sub, obj['created_utc'], obj['author'], line))
+
+            db_row = tuple(obj.get(col[0], None) for col in COLUMNS)
+            accumulated.append(db_row)
         queue_out.put(accumulated)
         accumulated = [ ]
     # Don't forget to push the final stuff through.
     queue_out.put(accumulated)
-    accumulated = [ ]
-    queue_out.put('DONE')
 
 
 
+INSERT = f'INSERT INTO {TABLE} VALUES({",".join(["?"]*len(COLUMNS))})'
 def insert(queue):
     """Read from queue and insert into the database"""
     def get():
@@ -105,7 +179,8 @@ def insert(queue):
             print(f' '*15, f'insert ({queue.qsize()} waiting)')
             yield from x
 
-    conn.executemany('INSERT INTO submissions VALUES(?, ?, ?, ?)', get())
+    conn.executemany(INSERT, get())
+    conn.commit()
 
 
 # Status variables for our progress
@@ -118,29 +193,35 @@ bad_lines = 0
 queue1 = multiprocessing.Queue(maxsize=50)
 queue2 = multiprocessing.Queue(maxsize=50)
 
-# start inserting process
-p_insert = multiprocessing.Process(target=insert, args=(queue2,))
-p_insert.start()
-
 # start decoding process
-p_decode = multiprocessing.Process(target=decode, args=(queue1, queue2,))
-p_decode.start()
+decode_ps = [ multiprocessing.Process(target=decode, args=(queue1, queue2,)) for _ in range(args.decoders) ]
+for p in decode_ps:
+    p.start()
+
+# start inserting process
+insert_p = multiprocessing.Process(target=insert, args=(queue2,))
+insert_p.start()
 
 
-# For every file
-for file_ in args.files:
 
-    sub = os.path.basename(file_).rsplit('_', 1)[0]
-    file_size = os.stat(file_).st_size
+# For every file, via multiprocessing.Pool
 
-    p_read = multiprocessing.Process(target=read, args=(queue1, file_, sub, file_size))
-    p_read.start()
-    p_read.join()
-    print("reading: done")
+#p_read = multiprocessing.Process(target=read, args=(queue1, file_))
+read_pool = multiprocessing.Pool(processes=args.readers)
+read_pool.map(read, args.files)
+read_pool.close()
+read_pool.join()
+print("reading: done")
+
+# Close all decoders
+for _ in range(args.decoders):
     queue1.put('DONE')
-    p_decode.join()
-    p_insert.join()
+queue1.close()
+for p in decode_ps:
+    p.join()
 
+# Close all joiners
+queue2.put('DONE')
+insert_p.join()
 
-
-#conn.execute('PRAGMA journal_mode = WAL;')
+conn.execute('PRAGMA journal_mode = WAL;')
