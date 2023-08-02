@@ -67,9 +67,9 @@ if args.comments:
 
 # Open and set up database
 conn = sqlite3.connect(args.db)
-conn.execute('PRAGMA page_size = 32768;')
-#conn.execute('PRAGMA mmap_siz = 10737418240;')
-conn.execute('PRAGMA journal_mode = off;') # or WAL
+conn.execute(f'PRAGMA page_size = 32768;')
+conn.execute(f'PRAGMA mmap_size = {200 * 2**30}')
+conn.execute(f'PRAGMA journal_mode = off;') # or WAL
 conn.commit()
 
 
