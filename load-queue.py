@@ -82,6 +82,7 @@ if args.index:
         ('submissions', 'author'),
         ('comments', 'subreddit, created_utc'),
         ('comments', 'subreddit, author'),
+        ('comments', 'subreddit, author, score'),
         ('comments', 'author'),
         ('comments', 'id'),
         ('comments', 'link_id'),
