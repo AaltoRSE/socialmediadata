@@ -57,6 +57,7 @@ parser.add_argument('--index', action='store_true', help="Do nothing but create 
 args = parser.parse_args()
 
 
+# Hackish way to select if we import submissions or comments
 TABLE = 'submissions'
 COLUMNS = columns_submissions
 if args.comments:
@@ -64,6 +65,15 @@ if args.comments:
     COLUMNS = columns_comments
 
 
+# Open and set up database
+conn = sqlite3.connect(args.db)
+conn.execute('PRAGMA page_size = 32768;')
+#conn.execute('PRAGMA mmap_siz = 10737418240;')
+conn.execute('PRAGMA journal_mode = off;') # or WAL
+conn.commit()
+
+
+# --index: don't do anything else, but make indexes
 if args.index:
     indexes = [
         ('submissions', 'subreddit, created_utc'),
@@ -71,25 +81,22 @@ if args.index:
         ('submissions', 'id'),
         ('submissions', 'author'),
         ('comments', 'subreddit, created_utc'),
-        ('comments', 'subreddit, auther'),
-        ('comments', 'auther'),
+        ('comments', 'subreddit, author'),
+        ('comments', 'author'),
         ('comments', 'id'),
         ('comments', 'link_id'),
         ('comments', 'parent_id'),
         ]
 
+    conn.execute('PRAGMA journal_mode = WAL;') # or WAL
     for i, (table, cols) in enumerate(indexes):
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{i} ON {table} ({cols})")
+        name = '_'.join(x[:3] for x in cols.split(', '))
+        cmd = f"CREATE INDEX IF NOT EXISTS idx_{table[:3]}_{name} ON {table} ({cols})"
+        print(cmd)
+        conn.execute(cmd)
         conn.commit()
-
     exit(0)
 
-# Open and set up database
-conn = sqlite3.connect(args.db)
-conn.execute('PRAGMA page_size = 32768;')
-#conn.execute('PRAGMA mmap_siz = 10737418240;')
-conn.execute('PRAGMA journal_mode = off;') # or WAL
-conn.commit()
 
 
 # Make columns, etc.
