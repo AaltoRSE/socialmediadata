@@ -138,7 +138,7 @@ def read(file_):
     # Put all the last stuff into queue
     queue.put(accumulated)
     bytes_processed += file_bytes_processed
-    print("read: done with {file_}")
+    print(f"read: done with {file_}")
     #queue.close()
 
 
