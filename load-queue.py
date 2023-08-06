@@ -106,7 +106,7 @@ if args.index:
 # Make columns, etc.
 #conn.execute('CREATE TABLE IF NOT EXISTS submissions (sub TEXT, time INTEGER, author TEXT, body BLOB)')
 conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} ('
-             f'{", ".join(" ".join(x) for x in COLUMNS)}'
+             f'{", ".join(" ".join(x[:2]) for x in COLUMNS)}'
              f')')
 conn.commit()
 
@@ -168,7 +168,8 @@ def decode(queue_in, queue_out):
             except (KeyError, json.JSONDecodeError) as err:
                 bad_lines += 1
 
-            db_row = tuple(obj.get(col[0], None) for col in COLUMNS)
+            db_row = tuple(col[2](obj)  if  len(col)>2   else   obj.get(col[0], None)
+                           for col in COLUMNS)
             accumulated.append(db_row)
         queue_out.put(accumulated)
         accumulated = [ ]
