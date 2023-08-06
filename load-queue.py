@@ -96,6 +96,9 @@ if args.index:
         print(cmd)
         conn.execute(cmd)
         conn.commit()
+    print("ANALYZE;")
+    conn.execute("ANALYZE;")
+    conn.commit()
     exit(0)
 
 
