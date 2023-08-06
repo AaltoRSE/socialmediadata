@@ -191,6 +191,14 @@ def insert(queue):
     conn.commit()
 
 
+
+# Verify that --comments is used for comment files and vice versa
+if args.comments:
+    assert all(x.endswith('_comments.zst') for x in args.files), "--comments but not all files end in _comments.zst"
+else:
+    assert all(x.endswith('_submissions.zst') for x in args.files), "not all files end in _submissions.zst"
+
+
 # Status variables for our progress
 bytes_processed = 0
 bytes_total = sum(os.stat(file_).st_size for file_ in args.files)
@@ -211,9 +219,7 @@ insert_p = multiprocessing.Process(target=insert, args=(queue2,))
 insert_p.start()
 
 
-
 # For every file, via multiprocessing.Pool
-
 #p_read = multiprocessing.Process(target=read, args=(queue1, file_))
 read_pool = multiprocessing.Pool(processes=args.readers)
 read_pool.map(read, args.files)
