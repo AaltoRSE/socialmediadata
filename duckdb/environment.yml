@@ -1,0 +1,9 @@
+name: duckdb
+channels:
+  - conda-forge
+dependencies:
+  - numpy
+  - pandas
+  - pip
+  - pip:
+    - duckdb==0.8.1
