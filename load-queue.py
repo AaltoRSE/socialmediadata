@@ -1,49 +1,15 @@
 import argparse
+import ctypes
 from datetime import datetime
+import glob
+import logging
 import multiprocessing
-import orjson as json
 import os
 import sqlite3
 import sys
 
+import orjson as json
 import zst
-
-
-columns_submissions = [
-    ('subreddit', 'TEXT'),
-    ('id', 'TEXT'),
-    ('created_utc', 'INTEGER'),
-    ('author', 'TEXT'),
-    ('hidden', 'INTEGER'),
-    ('is_self', 'INTEGER'),
-    ('domain', 'TEXT'),
-    ('num_comments', 'INTEGER'),
-    ('over_18', 'INTEGER'),
-    ('score', 'INTEGER'),
-    ('subreddit_id', 'TEXT'),
-    ('title', 'TEXT'),
-    ('url', 'TEXT'),
-    ('selftext', 'TEXT'),
-    ]
-
-columns_comments = [
-    ('subreddit', 'TEXT'),
-    ('author', 'TEXT'),
-    ('id', 'TEXT'),
-    ('link_id', 'TEXT'),
-    ('parent_id', 'TEXT'),
-    ('controversiality', 'INTEGER'),
-    ('created_utc', 'INTEGER'),
-    ('distinguished', 'INTEGER'),
-    ('ups', ''),
-    ('downs', 'INTEGER'),
-    ('gilded', 'INTEGER'),
-    ('score', 'INTEGER'),
-    ('score_hidden', 'INTEGER'),
-    ('subreddit_id', 'TEXT'),
-    ('name', 'TEXT'),
-    ('body', 'TEXT'),
-    ]
 
 
 # Arguments
@@ -54,7 +20,59 @@ parser.add_argument('--readers', type=int, default=1, help="num reader processes
 parser.add_argument('--decoders', type=int, default=1, help="num decoder processes")
 parser.add_argument('--comments', action='store_true', help="process comments files")
 parser.add_argument('--index', action='store_true', help="Do nothing but create indexes")
+parser.add_argument('--thin', action='store_true', help="Insert fewer columns")
 args = parser.parse_args()
+args.files = sum((glob.glob(f) for f in args.files), [])
+#print(args.files[:5])
+
+logger_root = logging.getLogger('')
+fh = logging.FileHandler('load-queue.log')
+fh.setLevel(logging.INFO)
+logger_root.addHandler(fh)
+log = logging.getLogger(__name__)
+
+columns_submissions = [
+    ('subreddit', 'TEXT'),
+    ('id', 'TEXT', lambda x: 't3_'+x['id']),
+    ('created_utc', 'INTEGER'),
+    ('author', 'TEXT'),
+    ('is_self', 'INTEGER'),
+    ('title', 'TEXT'),
+    ('score', 'INTEGER'),
+    ('num_comments', 'INTEGER'),
+]
+if not args.thin:
+    columns_submissions.extend([
+    ('subreddit_id', 'TEXT'),
+    ('hidden', 'INTEGER'),
+    ('domain', 'TEXT'),
+    ('over_18', 'INTEGER'),
+    ('url', 'TEXT'),
+    ('selftext', 'TEXT'),
+    ])
+
+columns_comments = [
+    ('subreddit', 'TEXT'),
+    ('author', 'TEXT'),
+    ('id', 'TEXT', lambda x: 't1_'+x['id']),
+    ('link_id', 'TEXT'),
+    ('created_utc', 'INTEGER'),
+    ('score', 'INTEGER'),
+    ]
+if not args.thin:
+    columns_submissions.extend([
+    ('parent_id', 'TEXT'),
+    ('controversiality', 'INTEGER'),
+    ('distinguished', 'INTEGER'),
+    ('ups', ''),
+    ('downs', 'INTEGER'),
+    ('gilded', 'INTEGER'),
+    ('score_hidden', 'INTEGER'),
+    ('subreddit_id', 'TEXT'),
+    ('name', 'TEXT'),
+    ('body', 'TEXT'),
+    ])
+
 
 
 # Hackish way to select if we import submissions or comments
@@ -96,6 +114,9 @@ if args.index:
         print(cmd)
         conn.execute(cmd)
         conn.commit()
+    print("ANALYZE;")
+    conn.execute("ANALYZE;")
+    conn.commit()
     exit(0)
 
 
@@ -103,8 +124,16 @@ if args.index:
 # Make columns, etc.
 #conn.execute('CREATE TABLE IF NOT EXISTS submissions (sub TEXT, time INTEGER, author TEXT, body BLOB)')
 conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} ('
-             f'{", ".join(" ".join(x) for x in COLUMNS)}'
+             f'{", ".join(" ".join(x[:2]) for x in COLUMNS)}'
              f')')
+conn.commit()
+
+# Store the history of this table
+conn.execute(f'CREATE TABLE IF NOT EXISTS history ('
+             f'time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, command TEXT'
+             f')')
+conn.commit()
+conn.execute("INSERT INTO history (command) VALUES (?)", (json.dumps(sys.argv), ))
 conn.commit()
 
 
@@ -115,31 +144,32 @@ def read(file_):
     queue = queue1
     file_size = os.stat(file_).st_size
     sub = os.path.basename(file_).rsplit('_', 1)[0]
-    global file_lines
-    global bad_lines
-    global bytes_processed
+    lines_file = 0
     accumulated = [ ]
 
-    print(f"read: starting {file_}")
+    #print(f"read: starting {file_}")
     for i, (line, file_bytes_processed) in enumerate(zst.read_lines_zst(file_)):
-        file_lines += 1
-        accumulated.append(line)
+        lines_file += 1
+        accumulated.append((i, line))
         # Every 100000 lines, print status and push into queue.
-        if file_lines % 100000 == 0:
+        if lines_file % 100000 == 0:
             #created = datetime.utcfromtimestamp(int(obj['created_utc']))
             print(f"{sub} "
                   #f"{created.strftime('%Y-%m-%d %H:%M:%S')} : "
-                  f"{file_lines:,} : {bad_lines:,} : {file_bytes_processed:,}: "
+                  f"{lines_file:,} ln : {lines_total.value:,} ln tot : {lines_bad.value:,} ln bad : {file_bytes_processed:,} B: "
                   f"{(file_bytes_processed / file_size) * 100:.0f}% "
-                  f"({((file_bytes_processed + bytes_processed) / bytes_total) * 100:.0f}%) "
+                  f"({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:.0f}%) "
                   f"({queue1.qsize()}, {queue2.qsize()})"
                   )
-            queue.put(accumulated)
+            queue.put((file_, accumulated))
             accumulated = [ ]
     # Put all the last stuff into queue
-    queue.put(accumulated)
-    bytes_processed += file_bytes_processed
-    print(f"read: done with {file_}")
+    queue.put((file_, accumulated))
+    with bytes_processed.get_lock():
+        bytes_processed.value += file_bytes_processed
+    with lines_total.get_lock():
+        lines_total.value += lines_file
+    #print(f"read: done with {file_}")
     #queue.close()
 
 
@@ -149,7 +179,6 @@ def decode(queue_in, queue_out):
     # While there is stuff in the queue...
     while True:
         x = queue_in.get()
-        print(f' '*7, f'decode: ({queue_in.qsize()} waiting)')
         # This is our sentinel to end processing.  It seems the queue
         # should raise ValueError once closed, but I haven't gotten
         # that to work.  Maybe it needs to be closed in every process.
@@ -157,15 +186,21 @@ def decode(queue_in, queue_out):
             print(' '*7, 'decode: done')
             break
 
+
         # For each line, load JSON and accumulate whatever our final
         # values will be.
-        for line in x:
+        file_, lines = x
+        print(f' '*7, f'decode: {len(lines)} ({queue_in.qsize()} waiting)')
+        for lineno, line in lines:
             try:
                 obj = json.loads(line)
             except (KeyError, json.JSONDecodeError) as err:
-                bad_lines += 1
+                with lines_bad.get_lock():
+                    lines_bad.value += 1
+                log.warning("bad line: %s: %s", file_, lineno)
 
-            db_row = tuple(obj.get(col[0], None) for col in COLUMNS)
+            db_row = tuple(col[2](obj)  if  len(col)>2   else   obj.get(col[0], None)
+                           for col in COLUMNS)
             accumulated.append(db_row)
         queue_out.put(accumulated)
         accumulated = [ ]
@@ -200,10 +235,11 @@ else:
 
 
 # Status variables for our progress
-bytes_processed = 0
+
 bytes_total = sum(os.stat(file_).st_size for file_ in args.files)
-file_lines = 0
-bad_lines = 0
+bytes_processed = multiprocessing.Value(ctypes.c_long, 0)
+lines_total = multiprocessing.Value(ctypes.c_long, 0)
+lines_bad = multiprocessing.Value(ctypes.c_long, 0)
 
 # Queues
 queue1 = multiprocessing.Queue(maxsize=50)
