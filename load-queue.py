@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import sqlite3
 import sys
+import time
 
 import orjson as json
 import zst
@@ -137,6 +138,23 @@ conn.execute("INSERT INTO history (command) VALUES (?)", (json.dumps(sys.argv), 
 conn.commit()
 
 
+class Averager:
+    def __init__(self, alpha=.01):
+        self.n = multiprocessing.Value(ctypes.c_long, 0)
+        self.a = multiprocessing.Value(ctypes.c_double, 0)
+    def add(self, x):
+        with self.n.get_lock():
+            self.n.value += 1
+            with self.a.get_lock():
+                if self.n == 1:
+                    self.a.value = x
+                else:
+                    self.a.value = x*alpha + self.a*(1-alpha)
+time_read = Averager()
+time_decode = Averager()
+time_insert = Averager()
+
+
 
 def read(file_):
     """Read and decompress lines from file, put in queue
@@ -159,7 +177,8 @@ def read(file_):
                   f"{lines_file:,} ln : {lines_total.value:,} ln tot : {lines_bad.value:,} ln bad : {file_bytes_processed:,} B: "
                   f"{(file_bytes_processed / file_size) * 100:.0f}% "
                   f"({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:.0f}%) "
-                  f"({queue1.qsize()}, {queue2.qsize()})"
+                  f"({queue1.qsize()}, {queue2.qsize()}) "
+                  f"({n_decode.value/runtime():3.1f}/s, {n_insert.value/runtime():3.1f}/s)"
                   )
             queue.put((file_, accumulated))
             accumulated = [ ]
@@ -186,7 +205,6 @@ def decode(queue_in, queue_out):
             print(' '*7, 'decode: done')
             break
 
-
         # For each line, load JSON and accumulate whatever our final
         # values will be.
         file_, lines = x
@@ -202,6 +220,10 @@ def decode(queue_in, queue_out):
             db_row = tuple(col[2](obj)  if  len(col)>2   else   obj.get(col[0], None)
                            for col in COLUMNS)
             accumulated.append(db_row)
+
+        with n_decode.get_lock():
+            n_decode.value += 1
+
         queue_out.put(accumulated)
         accumulated = [ ]
     # Don't forget to push the final stuff through.
@@ -220,6 +242,8 @@ def insert(queue):
                 print(' '*15, 'insert: done')
                 break
             print(f' '*15, f'insert ({queue.qsize()} waiting)')
+            with n_insert.get_lock():
+                n_insert.value += 1
             yield from x
 
     conn.executemany(INSERT, get())
@@ -240,6 +264,11 @@ bytes_total = sum(os.stat(file_).st_size for file_ in args.files)
 bytes_processed = multiprocessing.Value(ctypes.c_long, 0)
 lines_total = multiprocessing.Value(ctypes.c_long, 0)
 lines_bad = multiprocessing.Value(ctypes.c_long, 0)
+n_decode = multiprocessing.Value(ctypes.c_long, 0)
+n_insert = multiprocessing.Value(ctypes.c_long, 0)
+start = time.time()
+def runtime():
+    return time.time() - start
 
 # Queues
 queue1 = multiprocessing.Queue(maxsize=50)
