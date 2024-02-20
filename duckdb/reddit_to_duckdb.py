@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # coding=UTF-8
 
+import argparse
+import glob
 import os
 import sys
-import argparse
 
 import duckdb
 
@@ -74,6 +75,7 @@ def populate_db(db, file_paths, ncpus=1):
     db.execute('SET enable_progress_bar=true')
     db.execute(f'SET threads TO {ncpus}')
 
+    print(ncpus)
     if len(comments_paths) > 0:
         print(f'Ingesting these comments paths: {comments_paths}')
         db.execute(f'CREATE TABLE IF NOT EXISTS comments AS (SELECT * FROM read_json_auto([{comments_paths}], {settings}, columns={comments_schema}))')
@@ -88,9 +90,10 @@ if __name__ == "__main__":
     file_paths = sys.argv[1:]
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('db', type=str, help="DuckDB database file")
     parser.add_argument('files', nargs='+', help="Files to ingest")
-    parser.add_argument('-d','--db', type=str, nargs=1, default="reddit.db", help="DuckDB database file")
-    parser.add_argument('-c','--cpus', type=int, nargs=1, default=int(os.getenv("SLURM_CPUS_PER_TASK",1)), help="How many CPUs to use")
+    parser.add_argument('-c','--cpus', type=int, default=int(os.getenv("SLURM_CPUS_PER_TASK",1)), help="How many CPUs to use")
     args = parser.parse_args()
 
+    #files = args.files = sum((glob.glob(f) for f in args.files), [])
     populate_db(args.db, args.files, ncpus=args.cpus)
