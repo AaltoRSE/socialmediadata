@@ -18,15 +18,8 @@ def batched(iter, n):
     """like itertools.batched but that is python 3.12+"""
     return (iter[i:i + n] for i in range(0, len(iter), n))
 
-def populate_db(db, file_paths, ncpus=1, memlimit=None):
+def populate_db(db, file_paths):
     settings = f'compression=zstd, format=newline_delimited, union_by_name=true, ignore_errors=true'
-
-    db = duckdb.connect(db, read_only=False)
-    db.execute('SET enable_progress_bar=true')
-    if ncpus > 0:
-        db.execute(f'SET threads TO {ncpus}')
-        db.execute(f'SET external_threads TO {ncpus}')
-        print(f"Setting CPUs to {ncpus}")
 
     # Manage alreday-loaded files
     db.execute('CREATE TABLE IF NOT EXISTS loaded_files (file VARCHAR, time INT)')
@@ -99,20 +92,6 @@ def populate_db(db, file_paths, ncpus=1, memlimit=None):
     moderator: 'VARCHAR',
     }"""
 
-    # Infer memory limit
-    if not memlimit and 'SLURM_MEM_PER_NODE' in os.environ:
-        memlimit = int(os.environ['SLURM_MEM_PER_NODE']) - 500
-        memlimit = f'{memlimit}M'
-        print(f"Memory from SLURM_MEM_PER_NODE: {memlimit")
-    if not memlimit and 'SLURM_MEM_PER_CPU' in os.environ:
-        memlimit = int(os.environ['SLURM_MEM_PER_CPU']) * int(os.environ.get('SLURM_CPUS_PER_TASK', 1)) - 500
-        memlimit = f'{memlimit}M'
-        print(f"Memory from SLURM_MEM_PER_CPU: {memlimit}")
-    if memlimit:
-        db.execute(f"SET memory_limit = '{memlimit}'")
-        print(f"Setting mem limit to {memlimit}")
-
-    print(ncpus)
     if len(comments_paths) > 0:
         comments_paths_batched = batched(comments_paths, BATCHSIZE)
         comments = next(comments_paths_batched)
@@ -126,7 +105,7 @@ def populate_db(db, file_paths, ncpus=1, memlimit=None):
         db.execute(
             f'CREATE TABLE IF NOT EXISTS comments '
             f'AS (SELECT * FROM '
-            f'read_json_auto([{comments_str}], {settings}, columns={comments_schema}))'
+            f'read_json_auto([{comments_str}], {settings}, columns={comments_schema}, sample_size=1))'
             )
         db.executemany('INSERT INTO loaded_files VALUES (?, ?)', [(c, time.time()) for c in comments])
         db.commit()
@@ -141,7 +120,7 @@ def populate_db(db, file_paths, ncpus=1, memlimit=None):
             db.execute(
                 f'INSERT INTO comments '
                 f'(SELECT * FROM '
-                f'read_json_auto([{comments_str}], {settings}, columns={comments_schema}))'
+                f'read_json_auto([{comments_str}], {settings}, columns={comments_schema}, sample_size=1))'
                 )
             db.executemany('INSERT INTO loaded_files VALUES (?, ?)', [(c, time.time()) for c in comments])
             db.commit()
@@ -159,7 +138,7 @@ def populate_db(db, file_paths, ncpus=1, memlimit=None):
         db.execute(
             f'CREATE TABLE IF NOT EXISTS submissions '
             f'AS (SELECT * FROM '
-            f'read_json_auto([{submissions_str}], {settings}, columns={submissions_schema}))'
+            f'read_json_auto([{submissions_str}], {settings}, columns={submissions_schema}, sample_size=1))'
             )
         db.executemany('INSERT INTO loaded_files VALUES (?, ?)', [(s, time.time()) for s in submissions])
         db.commit()
@@ -174,7 +153,7 @@ def populate_db(db, file_paths, ncpus=1, memlimit=None):
             db.execute(
                 f'CREATE TABLE IF NOT EXISTS submissions '
                 f'AS (SELECT * FROM '
-                f'read_json_auto([{submissions_str}], {settings}, columns={submissions_schema}))'
+                f'read_json_auto([{submissions_str}], {settings}, columns={submissions_schema}, sample_size=1))'
                 )
             db.executemany('INSERT INTO loaded_files VALUES (?, ?)', [(s, time.time()) for s in submissions])
             db.commit()
@@ -188,18 +167,77 @@ def sort_by_size(files):
 
 if __name__ == "__main__":
 
-    file_paths = sys.argv[1:]
-
     parser = argparse.ArgumentParser()
     parser.add_argument('db', type=str, help="DuckDB database file")
     parser.add_argument('files', nargs='+', help="Files to ingest")
     parser.add_argument('-c','--cpus', type=int, default=int(os.getenv("SLURM_CPUS_PER_TASK",1)), help="How many CPUs to use, default %(default)s")
     parser.add_argument('-b','--batchsize', type=int, default=BATCHSIZE, help="How many files to import at once")
     parser.add_argument('--memlimit', help="Set a memory limit")
+    parser.add_argument('--index', action='store_true', help="Don't do anything, just make indexes in the db")
     args = parser.parse_args()
+
+    db = duckdb.connect(args.db, read_only=False)
+
+    # Set database basic limits
+    db.execute('SET enable_progress_bar=true')
+    if args.cpus > 0:
+        db.execute(f'SET threads TO {args.cpus}')
+        db.execute(f'SET external_threads TO {args.cpus}')
+        print(f"Setting CPUs to {args.cpus}")
+
+    # Infer memory limit
+    memlimit = args.memlimit
+    if not memlimit and 'SLURM_MEM_PER_NODE' in os.environ:
+        memlimit = int(os.environ['SLURM_MEM_PER_NODE']) - 500
+        memlimit = f'{memlimit}M'
+        print(f"Memory from SLURM_MEM_PER_NODE: {memlimit}")
+    if not memlimit and 'SLURM_MEM_PER_CPU' in os.environ:
+        memlimit = int(os.environ['SLURM_MEM_PER_CPU']) * int(os.environ.get('SLURM_CPUS_PER_TASK', 1)) - 500
+        memlimit = f'{memlimit}M'
+        print(f"Memory from SLURM_MEM_PER_CPU: {memlimit}")
+    if memlimit:
+        db.execute(f"SET memory_limit = '{memlimit}'")
+        print(f"Setting mem limit to {memlimit}")
+
+    # --index: don't do anything else, but make indexes
+    if args.index:
+        existing_indexes = { x[0] for x in db.execute('select index_name from duckdb_indexes').fetchall() }
+        print(existing_indexes)
+        indexes = [
+            ('submissions', 'subreddit, created_utc'),
+            ('submissions', 'subreddit, author'),
+            ('submissions', 'id'),
+            ('submissions', 'author'),
+            ('comments', 'subreddit, created_utc'),
+            ('comments', 'subreddit, author'),
+            ('comments', 'subreddit, author, score'),
+            ('comments', 'author', 'created_utc'),
+            ('comments', 'id'),
+            ('comments', 'link_id'),
+            ('comments', 'parent_id'),
+            ]
+
+        for i, (table, cols) in enumerate(indexes):
+            name = f'idx_{table[:3]}_' + '_'.join(x[:3] for x in cols.split(', '))
+            # IF NOT EXIST isn't implemented
+            print(name)
+            if name in existing_indexes:
+                continue
+            cmd = f"CREATE INDEX {name} ON {table} ({cols})"
+            print(cmd)
+            db.begin()
+            db.execute(cmd)
+            db.commit()
+        print("ANALYZE;")
+        db.begin()
+        db.execute("ANALYZE;")
+        db.commit()
+        exit(0)
+
+
 
     BATCHSIZE = args.batchsize
     setrlimit(RLIMIT_NOFILE, (max(BATCHSIZE+1000, getrlimit(RLIMIT_NOFILE)[0]), getrlimit(RLIMIT_NOFILE)[1]))
 
     files = args.files = sum((glob.glob(f) for f in args.files), [])
-    populate_db(args.db, args.files, ncpus=args.cpus, memlimit=args.memlimit)
+    populate_db(db, args.files)
