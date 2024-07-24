@@ -61,7 +61,7 @@ columns_comments = [
     ('score', 'INTEGER'),
     ]
 if not args.thin:
-    columns_submissions.extend([
+    columns_comments.extend([
     ('parent_id', 'TEXT'),
     ('controversiality', 'INTEGER'),
     ('distinguished', 'INTEGER'),
