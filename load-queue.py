@@ -2,6 +2,7 @@ import argparse
 import ctypes
 from datetime import datetime
 import glob
+import itertools
 import logging
 import multiprocessing
 import os
@@ -19,6 +20,7 @@ parser.add_argument('db')
 parser.add_argument('files', nargs='+')
 parser.add_argument('--readers', type=int, default=1, help="num reader processes")
 parser.add_argument('--decoders', type=int, default=1, help="num decoder processes")
+parser.add_argument('--chunk-lines', type=int, default=1000000, help="Lines per each chuck")
 parser.add_argument('--comments', action='store_true', help="process comments files")
 parser.add_argument('--index', action='store_true', help="Do nothing but create indexes")
 parser.add_argument('--thin', action='store_true', help="Insert fewer columns")
@@ -79,9 +81,11 @@ if not args.thin:
 # Hackish way to select if we import submissions or comments
 TABLE = 'submissions'
 COLUMNS = columns_submissions
+TYPE = 'S'
 if args.comments:
     TABLE = 'comments'
     COLUMNS = columns_comments
+    TYPE = 'C'
 
 
 # Open and set up database
@@ -105,6 +109,9 @@ if args.index:
         ('comments', 'author'),
         ('comments', 'id'),
         ('comments', 'link_id'),
+        ]
+    if not args.thin:
+        indexes.extend([
         ('comments', 'parent_id'),
         ]
 
@@ -112,10 +119,10 @@ if args.index:
     for i, (table, cols) in enumerate(indexes):
         name = '_'.join(x[:3] for x in cols.split(', '))
         cmd = f"CREATE INDEX IF NOT EXISTS idx_{table[:3]}_{name} ON {table} ({cols})"
-        print(cmd)
+        print(cmd, flush=True)
         conn.execute(cmd)
         conn.commit()
-    print("ANALYZE;")
+    print("ANALYZE;", flush=True)
     conn.execute("ANALYZE;")
     conn.commit()
     exit(0)
@@ -140,20 +147,30 @@ conn.commit()
 
 class Averager:
     def __init__(self, alpha=.01):
+        self.alpha = alpha
         self.n = multiprocessing.Value(ctypes.c_long, 0)
-        self.a = multiprocessing.Value(ctypes.c_double, 0)
+        self.a = multiprocessing.Value(ctypes.c_double, float('nan'))
     def add(self, x):
         with self.n.get_lock():
             self.n.value += 1
             with self.a.get_lock():
-                if self.n == 1:
+                if self.n.value == 1:
                     self.a.value = x
                 else:
-                    self.a.value = x*alpha + self.a*(1-alpha)
+                    self.a.value = x*self.alpha + self.a.value*(1-self.alpha)
+    @property
+    def avg(self):
+        return self.a.value
 time_read = Averager()
 time_decode = Averager()
 time_insert = Averager()
 
+
+def print_status(extra=''):
+    print(TYPE,
+          f"Queues: D: {queue1.qsize():3d}, I: {queue2.qsize():3d} "
+          f"Times: R:{time_read.avg:5.3f} D:{time_decode.avg:5.3f} I:{time_insert.avg:5.3f} -> {time_read.avg/time_insert.avg:4.1f} {time_decode.avg/time_insert.avg:4.1f} " + extra
+                  )
 
 
 def read(file_):
@@ -164,30 +181,33 @@ def read(file_):
     sub = os.path.basename(file_).rsplit('_', 1)[0]
     lines_file = 0
     accumulated = [ ]
+    start = time.time()
 
     #print(f"read: starting {file_}")
     for i, (line, file_bytes_processed) in enumerate(zst.read_lines_zst(file_)):
         lines_file += 1
         accumulated.append((i, line))
         # Every 100000 lines, print status and push into queue.
-        if lines_file % 100000 == 0:
+        if lines_file % args.chunk_lines == 0:
             #created = datetime.utcfromtimestamp(int(obj['created_utc']))
-            print(f"{sub} "
+            print_status(f"{sub:20s} "
                   #f"{created.strftime('%Y-%m-%d %H:%M:%S')} : "
-                  f"{lines_file:,} ln : {lines_total.value:,} ln tot : {lines_bad.value:,} ln bad : {file_bytes_processed:,} B: "
-                  f"{(file_bytes_processed / file_size) * 100:.0f}% "
-                  f"({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:.0f}%) "
-                  f"({queue1.qsize()}, {queue2.qsize()}) "
-                  f"({n_decode.value/runtime():3.1f}/s, {n_insert.value/runtime():3.1f}/s)"
+                  f"LinesSub: {lines_file:,} LinesTotal: {lines_total.value:,} LinesBad: {lines_bad.value:,} "
+                  f"FilePercent: {(file_bytes_processed / file_size) * 100:3.0f}% "
+                  f"TotalPercent: ({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:5.1f}%) "
                   )
+            time_read.add(time.time() - start)
+            start = time.time()
             queue.put((file_, accumulated))
             accumulated = [ ]
     # Put all the last stuff into queue
+    time_read.add(time.time() - start)
     queue.put((file_, accumulated))
     with bytes_processed.get_lock():
         bytes_processed.value += file_bytes_processed
     with lines_total.get_lock():
         lines_total.value += lines_file
+    sys.stdout.flush()
     #print(f"read: done with {file_}")
     #queue.close()
 
@@ -196,8 +216,9 @@ def decode(queue_in, queue_out):
     """Read from queue, decode JSON and make fields, add to next queue"""
     accumulated = [ ]
     # While there is stuff in the queue...
-    while True:
+    for i in itertools.count():
         x = queue_in.get()
+        start = time.time()
         # This is our sentinel to end processing.  It seems the queue
         # should raise ValueError once closed, but I haven't gotten
         # that to work.  Maybe it needs to be closed in every process.
@@ -208,7 +229,9 @@ def decode(queue_in, queue_out):
         # For each line, load JSON and accumulate whatever our final
         # values will be.
         file_, lines = x
-        print(f' '*7, f'decode: {len(lines)} ({queue_in.qsize()} waiting)')
+        print_status(f'decode: {len(lines)}')
+        if i % 100 == 0:
+            sys.stdout.flush()
         for lineno, line in lines:
             try:
                 obj = json.loads(line)
@@ -223,6 +246,7 @@ def decode(queue_in, queue_out):
 
         with n_decode.get_lock():
             n_decode.value += 1
+        time_decode.add(time.time() - start)
 
         queue_out.put(accumulated)
         accumulated = [ ]
@@ -236,15 +260,19 @@ def insert(queue):
     """Read from queue and insert into the database"""
     def get():
         """Generator to indefinitely return stuff to insert into the database"""
-        while True:
+        for i in itertools.count():
             x = queue.get()
+            start = time.time()
             if x == 'DONE':
                 print(' '*15, 'insert: done')
                 break
-            print(f' '*15, f'insert ({queue.qsize()} waiting)')
+            print_status('insert')
+            if i % 100 == 0:
+                sys.stdout.flush()
             with n_insert.get_lock():
                 n_insert.value += 1
             yield from x
+            time_insert.add(time.time() - start)
 
     conn.executemany(INSERT, get())
     conn.commit()
