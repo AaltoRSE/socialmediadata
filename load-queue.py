@@ -14,19 +14,28 @@ import orjson as json
 import zst
 
 
+# default CPUs
+cpus = 1
+if 'SLURM_CPUS_PER_TASK' in os.environ:
+    cpus = int(os.environ['SLURM_CPUS_PER_TASK'])
+
 # Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('db')
 parser.add_argument('files', nargs='+')
-parser.add_argument('--readers', type=int, default=1, help="num reader processes")
-parser.add_argument('--decoders', type=int, default=1, help="num decoder processes")
-parser.add_argument('--chunk-lines', type=int, default=1000000, help="Lines per each chuck")
+parser.add_argument('--sub-list', type=str, help="FILES is base and this argument is list of subs to add to the FILES argument.")
+parser.add_argument('--readers', type=int, default=(cpus//5)+1, help="num reader processes")
+parser.add_argument('--decoders', type=int, default=((3*cpus)//4)+1, help="num decoder processes")
+parser.add_argument('--chunk-lines', type=int, default=1000000, help="Lines per each chuck: how often things are inserted")
+parser.add_argument('--print-every', type=int, default=100, help="How often to print status")
+parser.add_argument('--insert-batch', type=int, default=10, help="Runs inserts every this many chunks")
 parser.add_argument('--comments', action='store_true', help="process comments files")
 parser.add_argument('--index', action='store_true', help="Do nothing but create indexes")
 parser.add_argument('--thin', action='store_true', help="Insert fewer columns")
 args = parser.parse_args()
 args.files = sum((glob.glob(f) for f in args.files), [])
 #print(args.files[:5])
+print(f"Readers: {args.readers}, Decoders: {args.decoders}")
 
 logger_root = logging.getLogger('')
 fh = logging.FileHandler('load-queue.log')
@@ -35,45 +44,47 @@ logger_root.addHandler(fh)
 log = logging.getLogger(__name__)
 
 columns_submissions = [
-    ('subreddit', 'TEXT'),
-    ('id', 'TEXT', lambda x: 't3_'+x['id']),
-    ('created_utc', 'INTEGER'),
-    ('author', 'TEXT'),
-    ('is_self', 'INTEGER'),
-    ('title', 'TEXT'),
-    ('score', 'INTEGER'),
-    ('num_comments', 'INTEGER'),
+    ('subreddit', 'TEXT'), # important
+    ('id', 'TEXT', lambda x: 't3_'+x['id']), # important
+    ('created_utc', 'INTEGER'), # important
+    ('author', 'TEXT'), # important
+    ('is_self', 'INTEGER'), # important
+    ('title', 'TEXT'), # important
+    ('score', 'INTEGER'), # important
+    ('num_comments', 'INTEGER'), # important
 ]
 if not args.thin:
     columns_submissions.extend([
-    ('subreddit_id', 'TEXT'),
+    #('subreddit_id', 'TEXT'),
     ('hidden', 'INTEGER'),
-    ('domain', 'TEXT'),
-    ('over_18', 'INTEGER'),
-    ('url', 'TEXT'),
-    ('selftext', 'TEXT'),
+    #('domain', 'TEXT'),
+    ('over_18', 'INTEGER'), # important
+    ('url', 'TEXT'), # important
+    ('selftext', 'TEXT'), # important
+    ('author_flair_text', 'TEXT')
     ])
 
 columns_comments = [
-    ('subreddit', 'TEXT'),
-    ('author', 'TEXT'),
-    ('id', 'TEXT', lambda x: 't1_'+x['id']),
-    ('link_id', 'TEXT'),
-    ('created_utc', 'INTEGER'),
-    ('score', 'INTEGER'),
+    ('subreddit', 'TEXT'), # important
+    ('author', 'TEXT'), # important
+    ('id', 'TEXT', lambda x: 't1_'+x['id']), # important
+    ('link_id', 'TEXT'), # important
+    ('created_utc', 'INTEGER'), # important
+    ('score', 'INTEGER'), # important
     ]
 if not args.thin:
     columns_comments.extend([
-    ('parent_id', 'TEXT'),
-    ('controversiality', 'INTEGER'),
-    ('distinguished', 'INTEGER'),
-    ('ups', ''),
-    ('downs', 'INTEGER'),
-    ('gilded', 'INTEGER'),
-    ('score_hidden', 'INTEGER'),
-    ('subreddit_id', 'TEXT'),
-    ('name', 'TEXT'),
-    ('body', 'TEXT'),
+    ('parent_id', 'TEXT'), # important
+    ('controversiality', 'INTEGER'), # important
+    ('distinguished', 'INTEGER'), # important
+    #('ups', ''),
+    #('downs', 'INTEGER'),
+    ('gilded', 'INTEGER'), # important
+    #('score_hidden', 'INTEGER'),
+    #('subreddit_id', 'TEXT'),
+    #('name', 'TEXT'),
+    ('body', 'TEXT'), # important
+    ('author_flair_text', 'TEXT')
     ])
 
 
@@ -90,9 +101,9 @@ if args.comments:
 
 # Open and set up database
 conn = sqlite3.connect(args.db)
-conn.execute(f'PRAGMA page_size = 32768;')
-conn.execute(f'PRAGMA mmap_size = {200 * 2**30}')
-conn.execute(f'PRAGMA journal_mode = off;') # or WAL
+conn.execute(f'PRAGMA page_size = 4096;')
+conn.execute(f'PRAGMA mmap_size = {2 * 2**30}')
+conn.execute(f'PRAGMA journal_mode = wal;') # or WAL
 conn.commit()
 
 
@@ -101,11 +112,13 @@ if args.index:
     indexes = [
         ('submissions', 'subreddit, created_utc'),
         ('submissions', 'subreddit, author'),
+        ('submissions', 'created_utc'),
         ('submissions', 'id'),
         ('submissions', 'author'),
         ('comments', 'subreddit, created_utc'),
         ('comments', 'subreddit, author'),
         ('comments', 'subreddit, author, score'),
+        ('comments', 'created_utc'),
         ('comments', 'author'),
         ('comments', 'id'),
         ('comments', 'link_id'),
@@ -113,9 +126,9 @@ if args.index:
     if not args.thin:
         indexes.extend([
         ('comments', 'parent_id'),
-        ]
+        ])
 
-    conn.execute('PRAGMA journal_mode = WAL;') # or WAL
+    #conn.execute('PRAGMA journal_mode = WAL;') # or WAL
     for i, (table, cols) in enumerate(indexes):
         name = '_'.join(x[:3] for x in cols.split(', '))
         cmd = f"CREATE INDEX IF NOT EXISTS idx_{table[:3]}_{name} ON {table} ({cols})"
@@ -164,12 +177,27 @@ class Averager:
 time_read = Averager()
 time_decode = Averager()
 time_insert = Averager()
+class RateAvg:
+    def __init__(self, alpha=.01):
+        self.interval = Averager(alpha=alpha)
+        self.last = multiprocessing.Value(ctypes.c_double, 0)
+        self.last.value = time.time()
+    def mark(self):
+        self.interval.add(time.time() - self.last.value)
+        self.last.value = time.time()
+    @property
+    def rate(self):
+        return 1./self.interval.avg
+rate_read = RateAvg()
+rate_decode = RateAvg()
+rate_insert = RateAvg()
+
 
 
 def print_status(extra=''):
     print(TYPE,
-          f"Queues: D: {queue1.qsize():3d}, I: {queue2.qsize():3d} "
-          f"Times: R:{time_read.avg:5.3f} D:{time_decode.avg:5.3f} I:{time_insert.avg:5.3f} -> {time_read.avg/time_insert.avg:4.1f} {time_decode.avg/time_insert.avg:4.1f} " + extra
+          f"Queues D/I: {queue1.qsize():3d} {queue2.qsize():3d}  "
+          f"Rates R/D/I: {1/time_read.avg:5.2f}/s {1/time_decode.avg:5.2f}/s {1/time_insert.avg:5.2f}/s ({rate_read.rate:5.2f}/s {rate_decode.rate:5.2f}/s {rate_insert.rate:5.2f}/s) " + extra
                   )
 
 
@@ -196,18 +224,25 @@ def read(file_):
                   f"FilePercent: {(file_bytes_processed / file_size) * 100:3.0f}% "
                   f"TotalPercent: ({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:5.1f}%) "
                   )
+            sys.stdout.flush()
             time_read.add(time.time() - start)
+            rate_read.mark()
             start = time.time()
             queue.put((file_, accumulated))
             accumulated = [ ]
     # Put all the last stuff into queue
     time_read.add(time.time() - start)
+    rate_read.mark()
     queue.put((file_, accumulated))
     with bytes_processed.get_lock():
         bytes_processed.value += file_bytes_processed
     with lines_total.get_lock():
         lines_total.value += lines_file
     sys.stdout.flush()
+    print_status(f"{sub:20s} "
+          #f"{created.strftime('%Y-%m-%d %H:%M:%S')} : "
+          f"TotalPercent: ({((bytes_processed.value) / bytes_total) * 100:5.1f}%) "
+          )
     #print(f"read: done with {file_}")
     #queue.close()
 
@@ -229,8 +264,8 @@ def decode(queue_in, queue_out):
         # For each line, load JSON and accumulate whatever our final
         # values will be.
         file_, lines = x
-        print_status(f'decode: {len(lines)}')
-        if i % 100 == 0:
+        if i % args.print_every == 0:
+            print_status(f'decode: {len(lines)}')
             sys.stdout.flush()
         for lineno, line in lines:
             try:
@@ -247,12 +282,24 @@ def decode(queue_in, queue_out):
         with n_decode.get_lock():
             n_decode.value += 1
         time_decode.add(time.time() - start)
+        rate_decode.mark()
 
         queue_out.put(accumulated)
         accumulated = [ ]
     # Don't forget to push the final stuff through.
     queue_out.put(accumulated)
 
+
+
+def batched(iterable, n, *, strict=False):
+    # batched('ABCDEFG', 3) → ABC DEF G
+    if n < 1:
+        raise ValueError('n must be at least one')
+    iterator = iter(iterable)
+    while batch := tuple(itertools.islice(iterator, n)):
+        if strict and len(batch) != n:
+            raise ValueError('batched(): incomplete batch')
+        yield batch
 
 
 INSERT = f'INSERT INTO {TABLE} VALUES({",".join(["?"]*len(COLUMNS))})'
@@ -266,24 +313,52 @@ def insert(queue):
             if x == 'DONE':
                 print(' '*15, 'insert: done')
                 break
-            print_status('insert')
-            if i % 100 == 0:
+            if i % args.print_every == 0:
+                print_status('insert')
                 sys.stdout.flush()
             with n_insert.get_lock():
                 n_insert.value += 1
-            yield from x
+            #yield from x
+            # insert here:
+            conn.executemany(INSERT, x)
+            conn.commit()
+            conn.execute('PRAGMA shrink_memory;')
+            print(f"Committed batch {i}")
+            sys.stdout.flush()
+            #
             time_insert.add(time.time() - start)
-
-    conn.executemany(INSERT, get())
-    conn.commit()
+            rate_insert.mark()
+    get()
+    #for i_batch, batch in enumerate(batched(get(), args.insert_batch)):
+    #    conn.executemany(INSERT, get())
+    #    conn.commit()
+    #    conn.execute('PRAGMA shrink_memory;')
+    #    print(f"Committed batch {i_batch}")
+    #    sys.stdout.flush()
 
 
 
 # Verify that --comments is used for comment files and vice versa
-if args.comments:
-    assert all(x.endswith('_comments.zst') for x in args.files), "--comments but not all files end in _comments.zst"
+if args.sub_list == '*':
+    base = args.files[0]
+    if args.comments:
+        args.files = glob.glob(os.path.join(base, '*_comments.zst'))
+    else:
+        args.files = glob.glob(os.path.join(base, '*_submissions.zst'))
+elif args.sub_list:
+    base = args.files[0]
+    sub_list = open(args.sub_list).read().split()
+    if args.comments:
+        args.files = [os.path.join(base, sub+'_comments.zst') for sub in sub_list]
+    else:
+        args.files = [os.path.join(base, sub+'_submissions.zst') for sub in sub_list]
 else:
-    assert all(x.endswith('_submissions.zst') for x in args.files), "not all files end in _submissions.zst"
+    if args.comments:
+        assert all(x.endswith('_comments.zst') for x in args.files), "--comments but not all files end in _comments.zst"
+    else:
+        assert all(x.endswith('_submissions.zst') for x in args.files), "not all files end in _submissions.zst"
+for file_ in args.files:
+    assert os.path.exists(file_)
 
 
 # Status variables for our progress
@@ -299,8 +374,8 @@ def runtime():
     return time.time() - start
 
 # Queues
-queue1 = multiprocessing.Queue(maxsize=50)
-queue2 = multiprocessing.Queue(maxsize=50)
+queue1 = multiprocessing.Queue(maxsize=10)
+queue2 = multiprocessing.Queue(maxsize=10)
 
 # start decoding process
 decode_ps = [ multiprocessing.Process(target=decode, args=(queue1, queue2,)) for _ in range(args.decoders) ]
@@ -331,4 +406,4 @@ for p in decode_ps:
 queue2.put('DONE')
 insert_p.join()
 
-conn.execute('PRAGMA journal_mode = WAL;')
+conn.execute('PRAGMA journal_mode = delete;')
