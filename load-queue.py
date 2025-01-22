@@ -6,6 +6,7 @@ import itertools
 import logging
 import multiprocessing
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -26,8 +27,8 @@ parser.add_argument('files', nargs='+')
 parser.add_argument('--sub-list', type=str, help="FILES is base and this argument is list of subs to add to the FILES argument.")
 parser.add_argument('--readers', type=int, default=(cpus//5)+1, help="num reader processes")
 parser.add_argument('--decoders', type=int, default=((3*cpus)//4)+1, help="num decoder processes")
-parser.add_argument('--chunk-lines', type=int, default=1000000, help="Lines per each chuck: how often things are inserted")
-parser.add_argument('--print-every', type=int, default=100, help="How often to print status")
+parser.add_argument('--chunk-lines', type=int, default=100000, help="Lines per each chuck: how often things are inserted")
+parser.add_argument('--print-every', type=int, default=1, help="How often to print status")
 parser.add_argument('--insert-batch', type=int, default=10, help="Runs inserts every this many chunks")
 parser.add_argument('--comments', action='store_true', help="process comments files")
 parser.add_argument('--index', action='store_true', help="Do nothing but create indexes")
@@ -101,7 +102,7 @@ if args.comments:
 
 # Open and set up database
 conn = sqlite3.connect(args.db)
-conn.execute(f'PRAGMA page_size = 4096;')
+conn.execute(f'PRAGMA page_size = 16384;')
 conn.execute(f'PRAGMA mmap_size = {2 * 2**30}')
 conn.execute(f'PRAGMA journal_mode = wal;') # or WAL
 conn.commit()
@@ -204,6 +205,7 @@ def print_status(extra=''):
 def read(file_):
     """Read and decompress lines from file, put in queue
     """
+    os.nice(5)
     queue = queue1
     file_size = os.stat(file_).st_size
     sub = os.path.basename(file_).rsplit('_', 1)[0]
@@ -216,13 +218,14 @@ def read(file_):
         lines_file += 1
         accumulated.append((i, line))
         # Every 100000 lines, print status and push into queue.
-        if lines_file % args.chunk_lines == 0:
+        if lines_file % (args.chunk_lines*args.print_every) == 0:
             #created = datetime.utcfromtimestamp(int(obj['created_utc']))
             print_status(f"{sub:20s} "
                   #f"{created.strftime('%Y-%m-%d %H:%M:%S')} : "
-                  f"LinesSub: {lines_file:,} LinesTotal: {lines_total.value:,} LinesBad: {lines_bad.value:,} "
-                  f"FilePercent: {(file_bytes_processed / file_size) * 100:3.0f}% "
-                  f"TotalPercent: ({((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:5.1f}%) "
+                  f"Tot%: {((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:5.1f}% "
+                  f"(bad: {lines_bad.value:,}) "
+                  f"File%: {(file_bytes_processed / file_size) * 100:3.0f}% "
+                  f"Line {lines_file:,}/{lines_total.value:,} "
                   )
             sys.stdout.flush()
             time_read.add(time.time() - start)
@@ -241,7 +244,8 @@ def read(file_):
     sys.stdout.flush()
     print_status(f"{sub:20s} "
           #f"{created.strftime('%Y-%m-%d %H:%M:%S')} : "
-          f"TotalPercent: ({((bytes_processed.value) / bytes_total) * 100:5.1f}%) "
+          f"Tot%: {((bytes_processed.value) / bytes_total) * 100:5.1f}% "
+          f"(bad: {lines_bad.value:,}) "
           )
     #print(f"read: done with {file_}")
     #queue.close()
@@ -249,6 +253,7 @@ def read(file_):
 
 def decode(queue_in, queue_out):
     """Read from queue, decode JSON and make fields, add to next queue"""
+    os.nice(5)
     accumulated = [ ]
     # While there is stuff in the queue...
     for i in itertools.count():
@@ -318,16 +323,27 @@ def insert(queue):
                 sys.stdout.flush()
             with n_insert.get_lock():
                 n_insert.value += 1
+            # Doing it here:
             #yield from x
             # insert here:
+            #conn.executemany(INSERT, x)
+            #conn.commit()
+            #conn.execute('PRAGMA shrink_memory;')
+            #print(f"Committed batch {i}")
+            #sys.stdout.flush()
+            #
+            # Direct inserts here:
             conn.executemany(INSERT, x)
-            conn.commit()
-            conn.execute('PRAGMA shrink_memory;')
-            print(f"Committed batch {i}")
-            sys.stdout.flush()
+            if (i+1) % args.insert_batch == 0:
+                conn.commit()
+                conn.execute('PRAGMA shrink_memory;')
+                print(f"Committed batch {i}")
             #
             time_insert.add(time.time() - start)
             rate_insert.mark()
+        conn.commit()
+        conn.execute('PRAGMA shrink_memory;')
+        print(f"Committed batch FINAL")
     get()
     #for i_batch, batch in enumerate(batched(get(), args.insert_batch)):
     #    conn.executemany(INSERT, get())
@@ -339,6 +355,11 @@ def insert(queue):
 
 
 # Verify that --comments is used for comment files and vice versa
+def noneint(x): return x if x is None else int(x)
+start = stop = interval = None
+if args.sub_list and (m := re.search(r'^(?P<base>[^\[]*)(\[(?P<start>\d)*(:(?P<stop>\d*)(:(?P<interval>\d*))?)?\])', args.sub_list)):
+    args.sub_list = m['base']
+    start, stop, interval = noneint(m['start']), noneint(m['stop']), noneint(m['interval'])
 if args.sub_list == '*':
     base = args.files[0]
     if args.comments:
@@ -359,6 +380,8 @@ else:
         assert all(x.endswith('_submissions.zst') for x in args.files), "not all files end in _submissions.zst"
 for file_ in args.files:
     assert os.path.exists(file_)
+if start is not None or stop is not None or interval is not None:
+    args.files = args.files[start:stop:interval]
 
 
 # Status variables for our progress
@@ -407,3 +430,6 @@ queue2.put('DONE')
 insert_p.join()
 
 conn.execute('PRAGMA journal_mode = delete;')
+
+print(f"Total walltime: {runtime()} s")
+print(f"Total process time (user+sys): {sum(os.times()[:4])} s") # user+child processes
