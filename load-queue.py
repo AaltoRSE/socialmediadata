@@ -225,7 +225,7 @@ def read(file_):
                   f"Tot%: {((file_bytes_processed + bytes_processed.value) / bytes_total) * 100:5.1f}% "
                   f"(bad: {lines_bad.value:,}) "
                   f"File%: {(file_bytes_processed / file_size) * 100:3.0f}% "
-                  f"Line {lines_file:,}/{lines_total.value:,} "
+                  f"Line {lines_file:,} ({lines_total.value:,}) "
                   )
             sys.stdout.flush()
             time_read.add(time.time() - start)
@@ -269,9 +269,9 @@ def decode(queue_in, queue_out):
         # For each line, load JSON and accumulate whatever our final
         # values will be.
         file_, lines = x
-        if i % args.print_every == 0:
-            print_status(f'decode: {len(lines)}')
-            sys.stdout.flush()
+        #if i % args.print_every == 0:
+        #    print_status(f'decode: {len(lines)}')
+        #    sys.stdout.flush()
         for lineno, line in lines:
             try:
                 obj = json.loads(line)
@@ -318,9 +318,9 @@ def insert(queue):
             if x == 'DONE':
                 print(' '*15, 'insert: done')
                 break
-            if i % args.print_every == 0:
-                print_status('insert')
-                sys.stdout.flush()
+            #if i % args.print_every == 0:
+            #    print_status('insert')
+            #    sys.stdout.flush()
             with n_insert.get_lock():
                 n_insert.value += 1
             # Doing it here:
@@ -374,6 +374,8 @@ elif args.sub_list:
     else:
         args.files = [os.path.join(base, sub+'_submissions.zst') for sub in sub_list]
 else:
+    print(args.files)
+    print(args.sub_list)
     if args.comments:
         assert all(x.endswith('_comments.zst') for x in args.files), "--comments but not all files end in _comments.zst"
     else:

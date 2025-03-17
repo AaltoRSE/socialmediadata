@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import itertools
 import os
 from pathlib import Path
 from resource import getrlimit, setrlimit, RLIMIT_NOFILE
@@ -14,9 +15,16 @@ import duckdb
 BATCHSIZE = 10000
 
 
-def batched(iter, n):
+def batched(iterable, n, *, strict=False):
     """like itertools.batched but that is python 3.12+"""
-    return (iter[i:i + n] for i in range(0, len(iter), n))
+    # batched('ABCDEFG', 3) → ABC DEF G
+    if n < 1:
+        raise ValueError('n must be at least one')
+    iterator = iter(iterable)
+    while batch := tuple(itertools.islice(iterator, n)):
+        if strict and len(batch) != n:
+            raise ValueError('batched(): incomplete batch')
+        yield batch
 
 def populate_db(db, file_paths):
     settings = f'compression=zstd, format=newline_delimited, union_by_name=true, ignore_errors=true'
