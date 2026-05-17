@@ -15,7 +15,7 @@ The basic use is by executing queries and getting tabular data
 out. Imagine it's like reading a CSV file, but you can do
 pre-filtering in the database engine *before* you get the data.  Since
 the database engine is very fast and designed for this, it saves you
-time and you can focus on only implementing interesting anylizes
+time and you can focus on only implementing interesting analyzes
 yourself.
 
 Advantages include:
@@ -67,7 +67,7 @@ df = pd.read_sql("QUERY", db)
 Loading into a networkx graph:
 ```python
 import sqlite3
-sqlite3.connect('/scratch/cs/socialmediadata/db.sqlite3')
+db = sqlite3.connect('file:/scratch/cs/socialmediadata/db.sqlite3?mode=ro&immutable=1', uri=True)
 G = networkx.DiGraph()
 G.add_edges_from(conn.execute('SELECT parent_id, id FROM comments '))
 ```
@@ -76,7 +76,22 @@ G.add_edges_from(conn.execute('SELECT parent_id, id FROM comments '))
 
 From here on out, it's all about making the right queries you need.
 SQL is fairly standardized so whatever you may know, can be used here.
-A lot will probabyl be learned by asking your colleagues what they
+A lot will probably be learned by asking your colleagues what they
 use, since the list below can never be kept up to date.
 
 TODO: add sample queries (ask your colleagues for now)
+
+Below are two queries that fetch comments/posts within a certain month in a certain subreddit:
+
+```python
+import sqlite, datetime
+conn = sqlite3.connect("file:/scratch/FILEPATH.sqlite3?immutable=1&mode=ro", uri=True)
+
+year = 2020
+month = 10
+ts_start = datetime.datetime(year, month, 1, 0).timestamp()
+ts_end = datetime.datetime(year, month + 1, 1, 0).timestamp()
+
+df_comment = pd.read_sql("SELECT subreddit, author, created_utc, score, body, id, parent_id, link_id FROM comments WHERE subreddit='%s' AND created_utc > %d AND created_utc < %d" % (subreddit, ts_start, ts_end), conn)
+df_post = pd.read_sql("SELECT subreddit, author, created_utc, score, title, selftext, id FROM submissions WHERE subreddit='%s' AND created_utc > %d AND created_utc < %d" % (subreddit, ts_start, ts_end), conn)
+```
