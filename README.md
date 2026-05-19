@@ -40,14 +40,18 @@ Disadvantages include:
 
 ### Usage
 
-Interactively open from the command line:
+Interactively open from the command line.  The `sqlite` module
+provides a command line interface for testing queries, and we almost
+always start by building queries this way before going to Python.
 
 ```console
 $ module load sqlite
 $ sqlite3 /PATH/TO/THE/DATABASE.sqlite3
 ```
 
-You can directly iterate over rows that come out:
+When you need to access data from Python, there are various options.
+You can directly iterate over rows that come out (if you don't need to
+store them all in memory at once):
 ```python
 conn = sqlite3.connect("file:/PATH/TO/THE/DATABASE.sqlite3?immutable=1&mode=ro", uri=True)
 for sub, title, author, time in conn.execute('SELECT subreddit, title, author, created_utc FROM submissions LIMIT 10'):
@@ -72,7 +76,40 @@ G = networkx.DiGraph()
 G.add_edges_from(conn.execute('SELECT parent_id, id FROM comments '))
 ```
 
-### Common qeries
+### Understanding what is in a database
+
+First, one would usually understand the data within a database by
+using the command line, before going to Python.  This allows quick
+iteration and understanding.  (when the data is very long, sometimes
+it is useful to add a SQL `WHERE` or `LIMIT` to reduce the amount of
+data while building the query, before trying to run it on the whole
+database).
+
+From the command line, you can check amount of data by subreddit and
+year:
+
+```sqlite
+sqlite> select strftime('%Y', created_utc, 'unixepoch') as year, subreddit, count(*), count(distinct(author)) from submissions group by year, subreddit order by year, subreddit;
+year  subreddit           count(*)  count(distinct(author))
+----  ------------------  --------  -----------------------
+2022  aaa                 4744      1838
+2022  bbbbb               10447     5530
+2023  aaa                 30        9
+2023  bbbbb               206064    63465
+```
+
+You can find the first and latest post on a subreddit:
+```sqlite
+sqlite> select min(strftime('%Y-%m-%d', created_utc, 'unixepoch')) as first_post, max(strftime('%Y-%m-%d', created_utc, 'unixepoch')) as latest_post, subreddit from submissions group by subreddit order by subreddit;
+first_post  latest_post  subreddit
+----------  -----------  ------------------
+2023-03-28  2025-12-31   aaa
+2022-08-26  2025-12-31   bbbbb
+```
+
+
+
+### Common queies
 
 From here on out, it's all about making the right queries you need.
 SQL is fairly standardized so whatever you may know, can be used here.
