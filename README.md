@@ -45,7 +45,7 @@ provides a command line interface for testing queries, and we almost
 always start by building queries this way before going to Python.
 
 ```console
-$ module load sqlite
+$ module load ml triton/2025.1-gcc sqlite/3.46.0
 $ sqlite3 /PATH/TO/THE/DATABASE.sqlite3
 ```
 
